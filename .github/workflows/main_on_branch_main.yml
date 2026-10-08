@@ -5,6 +5,12 @@ on:
     branches:
       - main
 
+# Run releases one at a time: release-drafter reuses the same draft until it is published,
+# so overlapping runs would mix commits and assets in one release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   test:
     name: 🧪 Test
