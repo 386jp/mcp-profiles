@@ -5,6 +5,12 @@ on:
     branches:
       - main
 
+# Run releases one at a time: release-drafter reuses the same draft until it is published,
+# so overlapping runs would mix commits and assets in one release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   test:
     name: 🧪 Test
@@ -47,5 +53,19 @@ jobs:
     secrets: inherit
     needs:
       - get_software_version
+    with:
+      version: ${{ needs.get_software_version.outputs.VERSION }}
+
+  # Publish only after every asset is attached: published releases are immutable.
+  release_publish:
+    name: 🚀 Publish release
+    uses: ./.github/workflows/reusable_publish_release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    needs:
+      - get_software_version
+      - image_push
+      - binaries_upload
     with:
       version: ${{ needs.get_software_version.outputs.VERSION }}
