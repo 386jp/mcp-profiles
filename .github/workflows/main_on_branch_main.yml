@@ -1,0 +1,51 @@
+name: "🎯 Main Branch Main Workflow"
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: 🧪 Test
+    uses: ./.github/workflows/reusable_test.yml
+    permissions:
+      contents: read
+
+  get_software_version:
+    name: 📦 Get software version
+    uses: ./.github/workflows/reusable_get_software_version.yml
+    permissions:
+      contents: write
+      pull-requests: read
+    secrets: inherit
+    needs:
+      - test
+    with:
+      update_mode: none
+      is_dev: false
+
+  image_push:
+    name: 🐳 Push docker image
+    uses: ./.github/workflows/reusable_push_image.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    needs:
+      - get_software_version
+    with:
+      version: ${{ needs.get_software_version.outputs.VERSION }}
+      image_tags: ${{ needs.get_software_version.outputs.VERSION }},latest
+      push: true
+
+  binaries_upload:
+    name: 📦 Upload binaries
+    uses: ./.github/workflows/reusable_upload_binaries.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    needs:
+      - get_software_version
+    with:
+      version: ${{ needs.get_software_version.outputs.VERSION }}

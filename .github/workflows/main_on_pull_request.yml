@@ -1,0 +1,22 @@
+name: "🔍 Pull Request Main Workflow"
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    name: 🧪 Test
+    uses: ./.github/workflows/reusable_test.yml
+    permissions:
+      contents: read
+
+  image_build:
+    name: 🐳 Build docker image
+    uses: ./.github/workflows/reusable_push_image.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: pr-${{ github.event.pull_request.number }}
+      image_tags: pr-${{ github.event.pull_request.number }}
+      push: false

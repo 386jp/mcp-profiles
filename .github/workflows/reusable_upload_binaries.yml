@@ -1,0 +1,55 @@
+name: "♻️ Upload binaries to release"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+        description: "Release tag to upload to, also embedded in the binaries"
+
+jobs:
+  build_and_upload:
+    name: Build binaries and upload them to the release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      # Each target builds in its own parallel step, so each gets its own log.
+      - parallel:
+          - name: Build darwin/amd64
+            env: { GOOS: darwin, GOARCH: amd64 }
+            run: &build |
+              name="mcp-profiles_${GOOS}_${GOARCH}"
+              mkdir -p "dist/$name"
+              go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "dist/$name/mcp-profiles" ./cmd/mcp-profiles
+              cp README.md "dist/$name/"
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+          - name: Build darwin/arm64
+            env: { GOOS: darwin, GOARCH: arm64 }
+            run: *build
+          - name: Build linux/amd64
+            env: { GOOS: linux, GOARCH: amd64 }
+            run: *build
+          - name: Build linux/arm64
+            env: { GOOS: linux, GOARCH: arm64 }
+            run: *build
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > checksums.txt
+
+      - name: Upload archives to the release
+        run: mise exec gh@2.101.0 -- gh release upload "$VERSION" dist/*.tar.gz dist/checksums.txt --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}

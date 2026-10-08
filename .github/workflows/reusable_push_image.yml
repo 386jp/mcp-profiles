@@ -1,0 +1,66 @@
+name: "♻️ Push image to GHCR"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+        description: "Version embedded in the binary (`mcp-profiles --version`)"
+      image_tags:
+        type: string
+        required: true
+        description: "List of comma-separated image tags to push to registry (eg: `latest,v1`)"
+      push:
+        type: boolean
+        required: true
+        description: "Push the image. When false, the image is only built"
+
+jobs:
+  build_and_push:
+    name: Build docker image and push it to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_TAGS: ${{ inputs.image_tags }}
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GitHub Container Registry
+        if: inputs.push
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create image names
+        id: image-names
+        run: |
+          {
+            echo "IMAGE_TAGS<<EOF"
+            echo "$IMAGE_TAGS" | tr ',' '\n' | sed "s|^|$REGISTRY/$IMAGE_NAME:|"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The Dockerfile cross-compiles, so both architectures build on one runner without emulation.
+      - name: Build and push image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          tags: ${{ steps.image-names.outputs.IMAGE_TAGS }}
+          build-args: VERSION=${{ inputs.version }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

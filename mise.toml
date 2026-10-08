@@ -1,0 +1,20 @@
+[tools]
+go = "1.27.1"
+golangci-lint = "2.14.0"
+
+[tasks.setup]
+description = "Set up the development environment"
+run = "go mod download"
+
+[tasks.build]
+description = "Build the mcp-profiles binary"
+env = { CGO_ENABLED = "0" }
+run = "go build -trimpath -ldflags='-s -w' -o bin/mcp-profiles ./cmd/mcp-profiles"
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"

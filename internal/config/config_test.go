@@ -1,0 +1,98 @@
+package config
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func env(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		return v, ok
+	}
+}
+
+func TestParseDefaults(t *testing.T) {
+	c, err := Parse([]byte(`{"profiles": {"dev": {"type": "http", "url": "http://localhost/mcp"}}}`), env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen.Type != TypeStdio || c.ProfileArg != "profile" || c.Log.Level != "info" || c.Log.Format != "text" {
+		t.Errorf("unexpected defaults: %+v", c)
+	}
+	if c.StartupTimeout() != 30*time.Second || c.CallTimeout() != 0 || c.ShutdownTimeout() != 10*time.Second {
+		t.Errorf("unexpected timeouts: %v %v %v", c.StartupTimeout(), c.CallTimeout(), c.ShutdownTimeout())
+	}
+}
+
+func TestParseHTTPListenDefaults(t *testing.T) {
+	c, err := Parse([]byte(`{
+		"listen": {"type": "http"},
+		"timeouts": {"call": "2m"},
+		"profiles": {"dev": {"type": "stdio", "command": "x"}}
+	}`), env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen.Addr != "127.0.0.1:8000" || c.Listen.Path != "/mcp" {
+		t.Errorf("unexpected listen: %+v", c.Listen)
+	}
+	if c.CallTimeout() != 2*time.Minute {
+		t.Errorf("call timeout = %v", c.CallTimeout())
+	}
+}
+
+func TestParseExpandsEnv(t *testing.T) {
+	c, err := Parse([]byte(`{
+		"listen": {"type": "http", "headers": {"Authorization": "Bearer ${TOKEN}"}},
+		"profiles": {
+			"dev": {"type": "http", "url": "${HOST:-http://localhost}/mcp", "headers": {"X-Key": "${KEY}"}},
+			"prod": {"type": "stdio", "command": "${CMD}", "args": ["--dir", "${DIR}"], "env": {"A": "${KEY}"}}
+		}
+	}`), env(map[string]string{"TOKEN": "t", "KEY": "k", "CMD": "run", "DIR": "/d"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Listen.Headers["Authorization"]; got != "Bearer t" {
+		t.Errorf("listen header = %q", got)
+	}
+	dev, prod := c.Profiles["dev"], c.Profiles["prod"]
+	if dev.URL != "http://localhost/mcp" || dev.Headers["X-Key"] != "k" {
+		t.Errorf("dev = %+v", dev)
+	}
+	if prod.Command != "run" || prod.Args[1] != "/d" || prod.Env["A"] != "k" {
+		t.Errorf("prod = %+v", prod)
+	}
+}
+
+func TestParseErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"unknown field", `{"profiles": {"dev": {"type": "http", "url": "u", "oauth": {}}}}`, "unknown field"},
+		{"no profiles", `{}`, "profiles must not be empty"},
+		{"sse type", `{"profiles": {"dev": {"type": "sse", "url": "u"}}}`, `profiles.dev.type must be`},
+		{"stdio without command", `{"profiles": {"dev": {"type": "stdio"}}}`, "command is required"},
+		{"http without url", `{"profiles": {"dev": {"type": "http"}}}`, "url is required"},
+		{"http with command", `{"profiles": {"dev": {"type": "http", "url": "u", "command": "c"}}}`, "only allowed for type \"stdio\""},
+		{"unknown default", `{"defaultProfile": "x", "profiles": {"dev": {"type": "http", "url": "u"}}}`, `defaultProfile "x"`},
+		{"description without list tool", `{"profiles": {"dev": {"type": "http", "url": "u", "description": "d"}}}`, "listProfilesTool is not"},
+		{"same builtin names", `{"listProfilesTool": "t", "reconnectTool": "t", "profiles": {"dev": {"type": "http", "url": "u"}}}`, "must differ"},
+		{"stdio listen with addr", `{"listen": {"type": "stdio", "addr": ":1"}, "profiles": {"dev": {"type": "http", "url": "u"}}}`, "only allowed for type \"http\""},
+		{"bad path", `{"listen": {"type": "http", "path": "mcp"}, "profiles": {"dev": {"type": "http", "url": "u"}}}`, "must start with"},
+		{"bad level", `{"log": {"level": "trace"}, "profiles": {"dev": {"type": "http", "url": "u"}}}`, "log.level"},
+		{"negative duration", `{"timeouts": {"call": "-1s"}, "profiles": {"dev": {"type": "http", "url": "u"}}}`, "negative"},
+		{"unset env", `{"profiles": {"dev": {"type": "http", "url": "${NOPE}"}}}`, "NOPE is not set"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.json), env(nil))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("err = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
