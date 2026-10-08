@@ -36,7 +36,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          publish: true
+          # Keep the release a draft: with immutable releases, assets can only be attached
+          # before publishing. reusable_publish_release.yml publishes it after the uploads.
+          publish: false
           commitish: "${{ github.event.pull_request.head.sha || github.sha }}"
           prerelease: ${{ env.IS_DEV }}
           prerelease-identifier: ${{ inputs.is_dev && 'alpha' || '' }}

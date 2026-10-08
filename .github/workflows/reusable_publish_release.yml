@@ -1,0 +1,23 @@
+name: "♻️ Publish release"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+        description: "Tag of the draft release to publish"
+
+jobs:
+  publish:
+    name: Publish the draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        run: gh release edit "$VERSION" --draft=false
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}

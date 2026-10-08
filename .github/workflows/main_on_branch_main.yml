@@ -49,3 +49,17 @@ jobs:
       - get_software_version
     with:
       version: ${{ needs.get_software_version.outputs.VERSION }}
+
+  # Publish only after every asset is attached: published releases are immutable.
+  release_publish:
+    name: 🚀 Publish release
+    uses: ./.github/workflows/reusable_publish_release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    needs:
+      - get_software_version
+      - image_push
+      - binaries_upload
+    with:
+      version: ${{ needs.get_software_version.outputs.VERSION }}
