@@ -96,3 +96,35 @@ func TestParseErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseLazy(t *testing.T) {
+	const profiles = `"profiles": {"dev": {"type": "http", "url": "u"}}`
+	tests := []struct {
+		name string
+		lazy string
+		want Lazy
+	}{
+		{"omitted", ``, Lazy{}},
+		{"false", `"lazy": false,`, Lazy{}},
+		{"true", `"lazy": true,`, Lazy{Enabled: true, MaxConnected: 1}},
+		{"empty object", `"lazy": {},`, Lazy{Enabled: true, MaxConnected: 1}},
+		{"options", `"lazy": {"maxConnected": 2, "keepBase": true, "idleTimeout": "10m"},`, Lazy{Enabled: true, MaxConnected: 2, KeepBase: true, IdleTimeout: 10 * time.Minute}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := Parse([]byte(`{`+tt.lazy+profiles+`}`), env(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Lazy != tt.want {
+				t.Errorf("lazy = %+v, want %+v", c.Lazy, tt.want)
+			}
+		})
+	}
+
+	for _, bad := range []string{`"lazy": {"keepAlive": 2},`, `"lazy": {"maxConnected": 0},`, `"lazy": {"idleTimeout": "-1s"},`, `"lazy": "yes",`} {
+		if _, err := Parse([]byte(`{`+bad+profiles+`}`), env(nil)); err == nil || !strings.Contains(err.Error(), "lazy") {
+			t.Errorf("Parse(%s) err = %v, want a lazy error", bad, err)
+		}
+	}
+}

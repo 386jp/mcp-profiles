@@ -65,7 +65,11 @@ func (p *Proxy) handleReconnect(ctx context.Context, req *mcp.CallToolRequest) (
 	if !ok {
 		return errorResult(fmt.Sprintf("unknown profile %q", profile)), nil
 	}
-	return structuredResult(u.Reconnect(ctx))
+	state := u.Reconnect(ctx)
+	if state.Status == upstream.StatusActive {
+		p.markUsed(profile)
+	}
+	return structuredResult(state)
 }
 
 // structuredResult returns v as structured content and as JSON text.

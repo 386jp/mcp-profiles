@@ -39,6 +39,9 @@ type Proxy struct {
 	names     []string // sorted profile names
 	upstreams map[string]*upstream.Upstream
 	progress  progressRelay
+
+	recentMu sync.Mutex
+	recent   []string // profile names, most recently used first (lazy mode)
 	server    *mcp.Server
 
 	inflight inflight
@@ -70,6 +73,8 @@ func New(cfg *config.Config, opts Options) *Proxy {
 			CallTimeout:    cfg.CallTimeout(),
 			OnProgress:     p.progress.forward,
 			Transport:      opts.Transports[name],
+			Lazy:           cfg.Lazy.Enabled,
+			IdleTimeout:    cfg.Lazy.IdleTimeout,
 		})
 	}
 	slices.Sort(p.names)
@@ -77,9 +82,14 @@ func New(cfg *config.Config, opts Options) *Proxy {
 }
 
 // Start connects to every upstream, verifies that their tools match and builds the server.
+// In lazy mode, only the base profile is connected, to read the tools.
 // On error, all upstreams are closed.
 func (p *Proxy) Start(ctx context.Context) error {
-	tools, err := p.connectAll(ctx)
+	connect := p.connectAll
+	if p.cfg.Lazy.Enabled {
+		connect = p.connectBase
+	}
+	tools, err := connect(ctx)
 	if err == nil {
 		err = p.buildServer(tools)
 	}
@@ -171,6 +181,52 @@ func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 	return tools[base], nil
 }
 
+// connectBase reads the tools from the base profile only. The other profiles are checked
+// against them when they are first used.
+func (p *Proxy) connectBase(ctx context.Context) ([]*mcp.Tool, error) {
+	base := p.baseProfile()
+	tools, err := p.upstreams[base].Connect(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("profile %q: %w", base, err)
+	}
+	for _, u := range p.upstreams {
+		u.SetExpected(tools)
+	}
+	if p.cfg.Lazy.KeepBase {
+		p.markUsed(base)
+	} else {
+		p.upstreams[base].Release()
+	}
+	return tools, nil
+}
+
+// markUsed makes name the most recently used profile. In lazy mode, connected profiles
+// beyond lazy.maxConnected, oldest first, are disconnected once their running calls finish.
+func (p *Proxy) markUsed(name string) {
+	if !p.cfg.Lazy.Enabled {
+		return
+	}
+	p.recentMu.Lock()
+	defer p.recentMu.Unlock()
+	p.recent = slices.DeleteFunc(p.recent, func(n string) bool { return n == name })
+	p.recent = slices.Insert(p.recent, 0, name)
+
+	// Count only connected profiles, so that ones already idle do not take a slot.
+	connected := 1 // name itself, which is connected or about to be
+	for _, other := range p.recent[1:] {
+		u := p.upstreams[other]
+		if u.State().Status != upstream.StatusActive {
+			continue
+		}
+		if connected < p.cfg.Lazy.MaxConnected {
+			connected++
+			continue
+		}
+		// Closing a stdio upstream waits for the process to exit, so do not block the call.
+		go u.Release()
+	}
+}
+
 func (p *Proxy) buildServer(tools []*mcp.Tool) error {
 	exposed, err := toolset.WithProfileArg(tools, toolset.ProfileArg{
 		Name:         p.cfg.ProfileArg,
@@ -248,6 +304,7 @@ func (p *Proxy) forwardTool(name string) mcp.ToolHandler {
 			params.SetProgressToken(proxyToken)
 		}
 
+		p.markUsed(profile)
 		res, err := p.upstreams[profile].CallTool(ctx, params)
 		if err != nil {
 			return errorResult(fmt.Sprintf("profile %q: %v", profile, err)), nil

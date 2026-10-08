@@ -31,6 +31,8 @@ const (
 	defaultLogFormat  = "text"
 	defaultStartup    = 30 * time.Second
 	defaultShutdown   = 10 * time.Second
+
+	defaultMaxConnected = 1
 )
 
 // Config is the root of the configuration file.
@@ -38,6 +40,7 @@ type Config struct {
 	Listen           Listen             `json:"listen"`
 	Log              Log                `json:"log"`
 	Timeouts         Timeouts           `json:"timeouts"`
+	Lazy             Lazy               `json:"lazy"`
 	ProfileArg       string             `json:"profileArg"`
 	DefaultProfile   string             `json:"defaultProfile"`
 	ListProfilesTool string             `json:"listProfilesTool"`
@@ -64,6 +67,48 @@ type Timeouts struct {
 	Startup  *Duration `json:"startup"`
 	Call     *Duration `json:"call"`
 	Shutdown *Duration `json:"shutdown"`
+}
+
+// Lazy enables lazy mode, where upstreams are connected on first use and only the
+// most recently used ones stay connected. It accepts true, false or an object.
+type Lazy struct {
+	Enabled bool
+	// MaxConnected is how many of the most recently used upstreams stay connected.
+	MaxConnected int
+	// KeepBase keeps the base profile connected after its tools are read at startup.
+	KeepBase bool
+	// IdleTimeout disconnects the connected upstream after this long without calls. Zero means never.
+	IdleTimeout time.Duration
+}
+
+func (l *Lazy) UnmarshalJSON(b []byte) error {
+	var enabled bool
+	if err := json.Unmarshal(b, &enabled); err == nil {
+		*l = Lazy{Enabled: enabled}
+		if enabled {
+			l.MaxConnected = defaultMaxConnected
+		}
+		return nil
+	}
+	var obj struct {
+		MaxConnected *int      `json:"maxConnected"`
+		KeepBase     bool      `json:"keepBase"`
+		IdleTimeout  *Duration `json:"idleTimeout"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&obj); err != nil {
+		return fmt.Errorf("lazy must be a boolean or an object with maxConnected, keepBase and idleTimeout: %w", err)
+	}
+	maxConnected := defaultMaxConnected
+	if obj.MaxConnected != nil {
+		maxConnected = *obj.MaxConnected
+	}
+	if maxConnected < 1 {
+		return fmt.Errorf("lazy.maxConnected must be at least 1: %d", maxConnected)
+	}
+	*l = Lazy{Enabled: true, MaxConnected: maxConnected, KeepBase: obj.KeepBase, IdleTimeout: durationOr(obj.IdleTimeout, 0)}
+	return nil
 }
 
 // Profile is one upstream MCP server, in the same shape as an .mcp.json entry.
