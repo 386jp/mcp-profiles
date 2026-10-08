@@ -115,6 +115,7 @@ mcp-profiles is configured entirely by a JSON file. Its path is read from the `M
 | `reconnectTool` | none | Name of the reconnect tool. Not exposed if omitted |
 | `log` | `{"level": "info", "format": "text"}` | `level` is `debug` / `info` / `warn` / `error`; `format` is `text` / `json`. Logs always go to stderr |
 | `timeouts` | see below | Go duration strings (`30s`, `2m`). `0s` means no timeout |
+| `lazy` | `false` | Connect upstreams on first use (see [Lazy mode](#lazy-mode)) |
 
 | `timeouts` key | Default | Applies to |
 |---|---|---|
@@ -146,11 +147,28 @@ Each entry has the same shape as an `.mcp.json` server entry.
 - With `headers`, only requests carrying all of them with matching values are accepted; others get `401`.
 - Binding to a non-loopback address without `headers` logs a warning at startup.
 
+### Lazy mode
+
+By default, every upstream is connected at startup and stays connected. With many profiles, especially stdio upstreams that each start a process, set `lazy` to connect them only when needed:
+
+```json
+"lazy": true
+"lazy": { "maxConnected": 2, "keepBase": true, "idleTimeout": "10m" }
+```
+
+- At startup, only the base profile (`defaultProfile`, or the first profile name in sorted order) is connected, to read the tools. It is disconnected right after, unless `keepBase` is `true`.
+- A profile is connected on its first call, and its tools are checked against the base profile's then. A mismatch disables the profile instead of failing the startup.
+- Only the `maxConnected` most recently used profiles stay connected (default `1`). When another profile is called, the least recently used connected one is disconnected once its running calls finish.
+- With `idleTimeout`, the connected profile is also disconnected after that long without calls. Defaults to `0s` (never).
+- Disconnected profiles show up as `idle`. Profiles disabled by a failure still need the reconnect tool.
+
+`"lazy": true` is the same as `"lazy": {}`: `maxConnected` defaults to `1` and `keepBase` to `false`.
+
 ## Builtin tools
 
 | Tool | Description |
 |---|---|
-| Profile listing (`listProfilesTool`) | Returns each profile's name, `description`, status (`active` / `reconnecting` / `disabled`) and the reason it was disabled |
+| Profile listing (`listProfilesTool`) | Returns each profile's name, `description`, status (`active` / `idle` / `reconnecting` / `disabled`) and the reason it was disabled |
 | Reconnect (`reconnectTool`) | Reconnects a profile, and makes it `active` again if its tools still match the ones seen at startup |
 
 ## Upstream failures and changes
@@ -162,7 +180,7 @@ Each entry has the same shape as an `.mcp.json` server entry.
 
 ## How it works
 
-- At startup, mcp-profiles connects to the upstream of every profile and checks that they expose the same tool names and the same `inputSchema` for each tool. Any mismatch fails the startup.
+- At startup, mcp-profiles connects to the upstream of every profile and checks that they expose the same tool names and the same `inputSchema` for each tool. Any mismatch fails the startup. In [lazy mode](#lazy-mode), this check happens when each profile is first used.
 - Every tool is exposed with an extra `profile` argument whose `enum` lists the profile names.
 - On `tools/call`, the `profile` argument is removed and the call is forwarded as is to the selected upstream.
 - Each upstream can use its own transport. stdio and streamable HTTP can be mixed.

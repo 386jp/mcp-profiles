@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -303,4 +304,114 @@ func TestShutdownRejectsNewCalls(t *testing.T) {
 	if !res.IsError || !strings.Contains(text(t, res), "shutting down") {
 		t.Errorf("got %v %q", res.IsError, text(t, res))
 	}
+}
+
+func statuses(t *testing.T, d *downstream) map[string]string {
+	t.Helper()
+	var got listProfilesResult
+	if err := json.Unmarshal([]byte(text(t, call(t, d, "list_profiles", nil))), &got); err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]string{}
+	for _, s := range got.Profiles {
+		m[s.Name] = string(s.Status)
+	}
+	return m
+}
+
+// waitStatuses polls until the profile statuses match, since releases happen in the background.
+func waitStatuses(t *testing.T, d *downstream, want map[string]string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := statuses(t, d)
+		if reflect.DeepEqual(got, want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("statuses = %v, want %v", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func lazyConfig(lazy config.Lazy, dev, prod *upstreamHTTP) *config.Config {
+	return &config.Config{
+		ProfileArg:       "profile",
+		DefaultProfile:   "dev",
+		ListProfilesTool: "list_profiles",
+		Lazy:             lazy,
+		Profiles: map[string]config.Profile{
+			"dev":  httpProfile(dev, nil),
+			"prod": httpProfile(prod, nil),
+		},
+	}
+}
+
+func TestLazyKeepsOnlyTheLastUsedProfile(t *testing.T) {
+	dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+	prod := startUpstream(t, newUpstreamServer("prod", false), nil)
+	_, d := startProxy(t, lazyConfig(config.Lazy{Enabled: true, MaxConnected: 1}, dev, prod))
+
+	waitStatuses(t, d, map[string]string{"dev": "idle", "prod": "idle"})
+
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "prod"})); got != "prod:hi" {
+		t.Errorf("got %q", got)
+	}
+	waitStatuses(t, d, map[string]string{"dev": "idle", "prod": "active"})
+
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi"})); got != "dev:hi" {
+		t.Errorf("got %q", got)
+	}
+	waitStatuses(t, d, map[string]string{"dev": "active", "prod": "idle"})
+}
+
+func TestLazyKeepBase(t *testing.T) {
+	dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+	prod := startUpstream(t, newUpstreamServer("prod", false), nil)
+	_, d := startProxy(t, lazyConfig(config.Lazy{Enabled: true, MaxConnected: 1, KeepBase: true}, dev, prod))
+	waitStatuses(t, d, map[string]string{"dev": "active", "prod": "idle"})
+}
+
+func TestLazyChecksSchemaOnFirstUse(t *testing.T) {
+	dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+	prod := startUpstream(t, newUpstreamServer("prod", true), nil)
+	// Startup succeeds because prod is not connected yet.
+	_, d := startProxy(t, lazyConfig(config.Lazy{Enabled: true, MaxConnected: 1}, dev, prod))
+
+	res := call(t, d, "echo", map[string]any{"text": "hi", "profile": "prod"})
+	if !res.IsError || !strings.Contains(text(t, res), `tool "extra" is unexpected`) {
+		t.Errorf("got %v %q", res.IsError, text(t, res))
+	}
+	waitStatuses(t, d, map[string]string{"dev": "idle", "prod": "disabled"})
+
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "dev"})); got != "dev:hi" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestLazyMaxConnected(t *testing.T) {
+	cfg := &config.Config{
+		ProfileArg:       "profile",
+		ListProfilesTool: "list_profiles",
+		Lazy:             config.Lazy{Enabled: true, MaxConnected: 2},
+		Profiles:         map[string]config.Profile{},
+	}
+	for _, name := range []string{"dev", "stg", "prod"} {
+		cfg.Profiles[name] = httpProfile(startUpstream(t, newUpstreamServer(name, false), nil), nil)
+	}
+	_, d := startProxy(t, cfg)
+
+	for _, name := range []string{"prod", "stg"} {
+		call(t, d, "echo", map[string]any{"text": "hi", "profile": name})
+	}
+	waitStatuses(t, d, map[string]string{"dev": "idle", "stg": "active", "prod": "active"})
+
+	// prod is the least recently used, so it is the one disconnected.
+	call(t, d, "echo", map[string]any{"text": "hi", "profile": "dev"})
+	waitStatuses(t, d, map[string]string{"dev": "active", "stg": "active", "prod": "idle"})
+
+	// Using stg again keeps it, and dev stays as the second most recent.
+	call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})
+	waitStatuses(t, d, map[string]string{"dev": "active", "stg": "active", "prod": "idle"})
 }

@@ -29,6 +29,8 @@ const (
 	StatusActive       Status = "active"
 	StatusReconnecting Status = "reconnecting"
 	StatusDisabled     Status = "disabled"
+	// StatusIdle means not connected in lazy mode. The next call connects.
+	StatusIdle Status = "idle"
 )
 
 // State is a snapshot of a profile's state, as returned by the builtin tools.
@@ -66,6 +68,10 @@ type Options struct {
 	OnProgress func(context.Context, *mcp.ProgressNotificationParams)
 	// Transport overrides the transport built from the profile. Used in tests.
 	Transport func() mcp.Transport
+	// Lazy makes an idle upstream connect on the next call instead of failing it.
+	Lazy bool
+	// IdleTimeout disconnects a lazy upstream after this long without calls. Zero means never.
+	IdleTimeout time.Duration
 }
 
 // Upstream is the connection to one profile's MCP server.
@@ -84,6 +90,11 @@ type Upstream struct {
 	session  *mcp.ClientSession
 	gen      uint64      // incremented on every new session, to ignore events from old ones
 	expected []*mcp.Tool // the tool snapshot taken at startup
+
+	// Lazy mode bookkeeping.
+	inflight       int  // running calls on the current session
+	releasePending bool // disconnect once inflight drops to zero
+	idleTimer      *time.Timer
 }
 
 // New returns an Upstream that is not connected yet.
@@ -92,7 +103,7 @@ func New(name string, profile config.Profile, opts Options) *Upstream {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Upstream{
+	u := &Upstream{
 		name:    name,
 		profile: profile,
 		opts:    opts,
@@ -100,6 +111,10 @@ func New(name string, profile config.Profile, opts Options) *Upstream {
 		status:  StatusDisabled,
 		reason:  "not connected",
 	}
+	if opts.Lazy {
+		u.status, u.reason = StatusIdle, ""
+	}
+	return u
 }
 
 // Name returns the profile name.
@@ -167,15 +182,13 @@ func (u *Upstream) Reconnect(ctx context.Context) State {
 	return u.State()
 }
 
-// CallTool forwards a tools/call to the upstream.
+// CallTool forwards a tools/call to the upstream. In lazy mode, an idle upstream is connected first.
 func (u *Upstream) CallTool(ctx context.Context, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	u.mu.Lock()
-	session := u.session
-	state := u.stateLocked()
-	u.mu.Unlock()
-	if state.Status != StatusActive || session == nil {
-		return nil, &UnavailableError{State: state}
+	session, gen, err := u.acquire(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer u.done(gen)
 
 	if u.opts.CallTimeout > 0 {
 		var cancel context.CancelFunc
@@ -185,6 +198,136 @@ func (u *Upstream) CallTool(ctx context.Context, params *mcp.CallToolParams) (*m
 	return session.CallTool(ctx, params)
 }
 
+// acquire returns the session for a call and counts the call as in flight on that session.
+func (u *Upstream) acquire(ctx context.Context) (*mcp.ClientSession, uint64, error) {
+	for {
+		u.mu.Lock()
+		if u.status == StatusActive && u.session != nil {
+			u.inflight++
+			u.releasePending = false
+			session, gen := u.session, u.gen
+			u.mu.Unlock()
+			return session, gen, nil
+		}
+		state := u.stateLocked()
+		u.mu.Unlock()
+		if state.Status != StatusIdle {
+			return nil, 0, &UnavailableError{State: state}
+		}
+		if err := u.connectIdle(ctx); err != nil {
+			return nil, 0, err
+		}
+	}
+}
+
+// done ends an in-flight call, disconnecting if a release was requested meanwhile.
+// Calls on a session that has since been replaced are not counted anymore.
+func (u *Upstream) done(gen uint64) {
+	u.mu.Lock()
+	if u.gen != gen {
+		u.mu.Unlock()
+		return
+	}
+	u.inflight--
+	var session *mcp.ClientSession
+	if u.inflight == 0 {
+		if u.releasePending {
+			session = u.goIdleLocked()
+		} else {
+			u.armIdleTimerLocked()
+		}
+	}
+	u.mu.Unlock()
+	if session != nil {
+		_ = session.Close()
+		u.logger.Debug("disconnected after the last call finished")
+	}
+}
+
+// connectIdle connects an idle upstream and checks its tools against the snapshot.
+// Concurrent callers wait for the first one and then find the upstream active.
+func (u *Upstream) connectIdle(ctx context.Context) error {
+	u.reconnectMu.Lock()
+	defer u.reconnectMu.Unlock()
+	if u.State().Status != StatusIdle {
+		return nil
+	}
+
+	session, tools, err := u.dial(ctx)
+	if err != nil {
+		// Stay idle so that the next call tries again.
+		return fmt.Errorf("connect: %w", err)
+	}
+	if err := u.checkTools(tools); err != nil {
+		_ = session.Close()
+		u.disable(err.Error())
+		u.logger.Error("disabled profile", "reason", err.Error())
+		return &UnavailableError{State: u.State()}
+	}
+	u.activate(session)
+	u.logger.Info("connected")
+	return nil
+}
+
+// Release disconnects a lazy upstream and makes it idle, once its in-flight calls finish.
+func (u *Upstream) Release() {
+	u.mu.Lock()
+	if u.status != StatusActive {
+		u.mu.Unlock()
+		return
+	}
+	if u.inflight > 0 {
+		u.releasePending = true
+		u.mu.Unlock()
+		return
+	}
+	session := u.goIdleLocked()
+	u.mu.Unlock()
+	_ = session.Close()
+	u.logger.Debug("disconnected")
+}
+
+// goIdleLocked detaches the session and makes the upstream idle. The caller closes the returned session.
+func (u *Upstream) goIdleLocked() *mcp.ClientSession {
+	session := u.session
+	u.session = nil
+	u.gen++ // the stdio watcher must not treat this exit as a failure
+	u.status, u.reason = StatusIdle, ""
+	u.releasePending = false
+	u.stopIdleTimerLocked()
+	return session
+}
+
+func (u *Upstream) armIdleTimerLocked() {
+	if !u.opts.Lazy || u.opts.IdleTimeout <= 0 {
+		return
+	}
+	if u.idleTimer == nil {
+		u.idleTimer = time.AfterFunc(u.opts.IdleTimeout, u.onIdleTimeout)
+		return
+	}
+	u.idleTimer.Reset(u.opts.IdleTimeout)
+}
+
+func (u *Upstream) stopIdleTimerLocked() {
+	if u.idleTimer != nil {
+		u.idleTimer.Stop()
+	}
+}
+
+func (u *Upstream) onIdleTimeout() {
+	u.mu.Lock()
+	// A running call re-arms the timer when it finishes.
+	if u.status != StatusActive || u.inflight > 0 {
+		u.mu.Unlock()
+		return
+	}
+	session := u.goIdleLocked()
+	u.mu.Unlock()
+	_ = session.Close()
+	u.logger.Info("disconnected after the idle timeout")
+}
+
 // Close closes the connection. stdio processes are terminated.
 func (u *Upstream) Close() error {
 	u.mu.Lock()
@@ -192,6 +335,7 @@ func (u *Upstream) Close() error {
 	u.session = nil
 	u.gen++
 	u.status, u.reason = StatusDisabled, "closed"
+	u.stopIdleTimerLocked()
 	u.mu.Unlock()
 	if session == nil {
 		return nil
@@ -282,6 +426,8 @@ func (u *Upstream) activate(session *mcp.ClientSession) {
 	u.gen++
 	gen := u.gen
 	u.status, u.reason = StatusActive, ""
+	u.inflight, u.releasePending = 0, false
+	u.armIdleTimerLocked()
 	u.mu.Unlock()
 
 	if u.profile.Type == config.TypeStdio {
@@ -359,6 +505,7 @@ func (u *Upstream) disableIfCurrent(gen uint64, reason string) bool {
 	}
 	u.session = nil
 	u.status, u.reason = StatusDisabled, reason
+	u.stopIdleTimerLocked()
 	return true
 }
 
