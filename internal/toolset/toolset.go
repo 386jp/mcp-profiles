@@ -43,6 +43,42 @@ func Diff(base, other []*mcp.Tool) ([]string, error) {
 	return diffs, nil
 }
 
+// Mismatch is a base tool that another profile lacks or defines differently.
+type Mismatch struct {
+	Tool   string `json:"tool"`
+	Reason string `json:"reason"`
+}
+
+// Reasons of a Mismatch.
+const (
+	ReasonMissing     = "not provided by this profile"
+	ReasonInputSchema = "inputSchema differs on this profile"
+)
+
+// Mismatched returns the base tools that other lacks or defines with a different inputSchema,
+// sorted by name. Tools that only other has are ignored, since they are not exposed.
+func Mismatched(base, other []*mcp.Tool) ([]Mismatch, error) {
+	baseSchemas, err := schemasByName(base)
+	if err != nil {
+		return nil, err
+	}
+	otherSchemas, err := schemasByName(other)
+	if err != nil {
+		return nil, err
+	}
+	var mismatches []Mismatch
+	for _, name := range sortedKeys(baseSchemas) {
+		o, ok := otherSchemas[name]
+		switch {
+		case !ok:
+			mismatches = append(mismatches, Mismatch{Tool: name, Reason: ReasonMissing})
+		case !bytes.Equal(baseSchemas[name], o):
+			mismatches = append(mismatches, Mismatch{Tool: name, Reason: ReasonInputSchema})
+		}
+	}
+	return mismatches, nil
+}
+
 func schemasByName(tools []*mcp.Tool) (map[string][]byte, error) {
 	m := make(map[string][]byte, len(tools))
 	for _, t := range tools {

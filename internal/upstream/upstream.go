@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,7 +40,13 @@ type State struct {
 	Description string `json:"description,omitempty"`
 	Status      Status `json:"status"`
 	Reason      string `json:"reason,omitempty"`
+	Warning     string `json:"warning,omitempty"`
+	// MismatchedTools lists the tools that cannot be called on this profile, with schemaMismatch "warn".
+	MismatchedTools []toolset.Mismatch `json:"mismatchedTools,omitempty"`
 }
+
+// mismatchWarning is reported for a profile whose tools differ from the exposed definitions.
+const mismatchWarning = "some tools differ from the definitions in your tool list and cannot be called on this profile"
 
 // UnavailableError is returned when calling a profile that is not active.
 type UnavailableError struct {
@@ -51,6 +58,17 @@ func (e *UnavailableError) Error() string {
 		return fmt.Sprintf("profile %q is %s: %s", e.State.Name, e.State.Status, e.State.Reason)
 	}
 	return fmt.Sprintf("profile %q is %s", e.State.Name, e.State.Status)
+}
+
+// MismatchError is returned, instead of calling the upstream, for a tool whose definition
+// on the profile differs from the exposed one.
+type MismatchError struct {
+	Profile string
+	Tool    string
+}
+
+func (e *MismatchError) Error() string {
+	return fmt.Sprintf("tool %q on profile %q differs from its definition in your tool list, so it was not called", e.Tool, e.Profile)
 }
 
 // Options configures an Upstream.
@@ -72,7 +90,17 @@ type Options struct {
 	Lazy bool
 	// IdleTimeout disconnects a lazy upstream after this long without calls. Zero means never.
 	IdleTimeout time.Duration
+	// TolerateMismatch keeps the profile when its tools differ from the snapshot, and rejects
+	// calls to the tools that differ, instead of disabling the profile.
+	TolerateMismatch bool
+	// ReportMismatch shows the tools that differ in State, with TolerateMismatch.
+	ReportMismatch bool
+	// Disabled keeps the upstream disabled for good: it is never connected.
+	Disabled bool
 }
+
+// reasonDisabledInConfig is the reason reported for a profile disabled in the configuration.
+const reasonDisabledInConfig = "disabled in config"
 
 // Upstream is the connection to one profile's MCP server.
 type Upstream struct {
@@ -90,6 +118,8 @@ type Upstream struct {
 	session  *mcp.ClientSession
 	gen      uint64      // incremented on every new session, to ignore events from old ones
 	expected []*mcp.Tool // the tool snapshot taken at startup
+	// mismatched holds the tools that differ from the snapshot, with TolerateMismatch.
+	mismatched []toolset.Mismatch
 
 	// Lazy mode bookkeeping.
 	inflight       int  // running calls on the current session
@@ -111,7 +141,10 @@ func New(name string, profile config.Profile, opts Options) *Upstream {
 		status:  StatusDisabled,
 		reason:  "not connected",
 	}
-	if opts.Lazy {
+	switch {
+	case opts.Disabled:
+		u.reason = reasonDisabledInConfig
+	case opts.Lazy:
 		u.status, u.reason = StatusIdle, ""
 	}
 	return u
@@ -128,12 +161,20 @@ func (u *Upstream) State() State {
 }
 
 func (u *Upstream) stateLocked() State {
-	return State{Name: u.name, Description: u.profile.Description, Status: u.status, Reason: u.reason}
+	s := State{Name: u.name, Description: u.profile.Description, Status: u.status, Reason: u.reason}
+	if len(u.mismatched) > 0 && u.opts.ReportMismatch {
+		s.Warning = mismatchWarning
+		s.MismatchedTools = slices.Clone(u.mismatched)
+	}
+	return s
 }
 
 // Connect connects to the upstream and returns its tools. The profile becomes active on success.
 // It is used at startup, before the expected tools are known.
 func (u *Upstream) Connect(ctx context.Context) ([]*mcp.Tool, error) {
+	if u.opts.Disabled {
+		return nil, errors.New(reasonDisabledInConfig)
+	}
 	u.reconnectMu.Lock()
 	defer u.reconnectMu.Unlock()
 
@@ -152,8 +193,15 @@ func (u *Upstream) SetExpected(tools []*mcp.Tool) {
 	u.expected = tools
 }
 
+// CheckTools compares tools with the snapshot. With TolerateMismatch, a difference is recorded
+// and nil is returned; otherwise it is returned as an error.
+func (u *Upstream) CheckTools(tools []*mcp.Tool) error { return u.checkTools(tools) }
+
 // Reconnect drops the current connection, connects again and checks the tools against the snapshot.
 func (u *Upstream) Reconnect(ctx context.Context) State {
+	if u.opts.Disabled {
+		return u.State()
+	}
 	u.reconnectMu.Lock()
 	defer u.reconnectMu.Unlock()
 
@@ -189,6 +237,13 @@ func (u *Upstream) CallTool(ctx context.Context, params *mcp.CallToolParams) (*m
 		return nil, err
 	}
 	defer u.done(gen)
+
+	u.mu.Lock()
+	mismatched := slices.ContainsFunc(u.mismatched, func(m toolset.Mismatch) bool { return m.Tool == params.Name })
+	u.mu.Unlock()
+	if mismatched {
+		return nil, &MismatchError{Profile: u.name, Tool: params.Name}
+	}
 
 	if u.opts.CallTimeout > 0 {
 		var cancel context.CancelFunc
@@ -484,8 +539,23 @@ func (u *Upstream) checkTools(tools []*mcp.Tool) error {
 	if err != nil {
 		return err
 	}
-	if diffs != nil {
+	if diffs != nil && !u.opts.TolerateMismatch {
 		return fmt.Errorf("tool schema changed: %s", toolset.FormatDiff(diffs))
+	}
+
+	mismatched, err := toolset.Mismatched(expected, tools)
+	if err != nil {
+		return err
+	}
+	u.mu.Lock()
+	u.mismatched = mismatched
+	u.mu.Unlock()
+	if len(mismatched) > 0 {
+		level := slog.LevelDebug // the differences are intended
+		if u.opts.ReportMismatch {
+			level = slog.LevelWarn
+		}
+		u.logger.Log(context.Background(), level, "tools differ from the exposed definitions; calls to them are rejected", "tools", mismatched)
 	}
 	return nil
 }
