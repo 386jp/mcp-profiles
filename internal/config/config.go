@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -83,6 +85,31 @@ type Timeouts struct {
 	Shutdown *Duration `json:"shutdown"`
 }
 
+// Base returns the profile whose tool definitions are exposed and compared against:
+// baseProfile, defaultProfile, or the first profile name in sorted order that is not disabled.
+func (c *Config) Base() string {
+	if c.BaseProfile != "" {
+		return c.BaseProfile
+	}
+	if c.DefaultProfile != "" {
+		return c.DefaultProfile
+	}
+	names := make([]string, 0, len(c.Profiles))
+	for name, p := range c.Profiles {
+		if !p.Disabled {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// Callable reports whether clients can call the profile: it is neither hidden nor disabled.
+func (p Profile) Callable() bool { return !p.Hidden && !p.Disabled }
+
 // ToleratesMismatch reports whether profiles whose tools differ stay available.
 func (c *Config) ToleratesMismatch() bool {
 	return c.SchemaMismatch == SchemaMismatchWarn || c.SchemaMismatch == SchemaMismatchSilent
@@ -132,13 +159,18 @@ func (l *Lazy) UnmarshalJSON(b []byte) error {
 
 // Profile is one upstream MCP server, in the same shape as an .mcp.json entry.
 type Profile struct {
-	Description string            `json:"description"`
-	Type        string            `json:"type"`
-	URL         string            `json:"url"`
-	Headers     map[string]string `json:"headers"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args"`
-	Env         map[string]string `json:"env"`
+	Description string `json:"description"`
+	// Hidden keeps the profile out of the tool definitions and the profile listing,
+	// so that it can serve only as baseProfile.
+	Hidden bool `json:"hidden"`
+	// Disabled keeps the profile from being connected or called.
+	Disabled bool              `json:"disabled"`
+	Type     string            `json:"type"`
+	URL      string            `json:"url"`
+	Headers  map[string]string `json:"headers"`
+	Command  string            `json:"command"`
+	Args     []string          `json:"args"`
+	Env      map[string]string `json:"env"`
 }
 
 // Duration is a time.Duration encoded as a Go duration string such as "30s".
@@ -273,14 +305,21 @@ func (c *Config) validate() error {
 		add("profiles must not be empty")
 	}
 	if c.DefaultProfile != "" {
-		if _, ok := c.Profiles[c.DefaultProfile]; !ok {
+		if p, ok := c.Profiles[c.DefaultProfile]; !ok {
 			add("defaultProfile %q is not defined in profiles", c.DefaultProfile)
+		} else if !p.Callable() {
+			add("defaultProfile %q must be neither hidden nor disabled", c.DefaultProfile)
 		}
 	}
 	if c.BaseProfile != "" {
-		if _, ok := c.Profiles[c.BaseProfile]; !ok {
+		if p, ok := c.Profiles[c.BaseProfile]; !ok {
 			add("baseProfile %q is not defined in profiles", c.BaseProfile)
+		} else if p.Disabled {
+			add("baseProfile %q must not be disabled", c.BaseProfile)
 		}
+	}
+	if len(c.Profiles) > 0 && !slices.ContainsFunc(slices.Collect(maps.Values(c.Profiles)), Profile.Callable) {
+		add("at least one profile must be neither hidden nor disabled")
 	}
 	switch c.SchemaMismatch {
 	case SchemaMismatchFail, SchemaMismatchWarn, SchemaMismatchSilent:

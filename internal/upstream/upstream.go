@@ -95,7 +95,12 @@ type Options struct {
 	TolerateMismatch bool
 	// ReportMismatch shows the tools that differ in State, with TolerateMismatch.
 	ReportMismatch bool
+	// Disabled keeps the upstream disabled for good: it is never connected.
+	Disabled bool
 }
+
+// reasonDisabledInConfig is the reason reported for a profile disabled in the configuration.
+const reasonDisabledInConfig = "disabled in config"
 
 // Upstream is the connection to one profile's MCP server.
 type Upstream struct {
@@ -136,7 +141,10 @@ func New(name string, profile config.Profile, opts Options) *Upstream {
 		status:  StatusDisabled,
 		reason:  "not connected",
 	}
-	if opts.Lazy {
+	switch {
+	case opts.Disabled:
+		u.reason = reasonDisabledInConfig
+	case opts.Lazy:
 		u.status, u.reason = StatusIdle, ""
 	}
 	return u
@@ -164,6 +172,9 @@ func (u *Upstream) stateLocked() State {
 // Connect connects to the upstream and returns its tools. The profile becomes active on success.
 // It is used at startup, before the expected tools are known.
 func (u *Upstream) Connect(ctx context.Context) ([]*mcp.Tool, error) {
+	if u.opts.Disabled {
+		return nil, errors.New(reasonDisabledInConfig)
+	}
 	u.reconnectMu.Lock()
 	defer u.reconnectMu.Unlock()
 
@@ -188,6 +199,9 @@ func (u *Upstream) CheckTools(tools []*mcp.Tool) error { return u.checkTools(too
 
 // Reconnect drops the current connection, connects again and checks the tools against the snapshot.
 func (u *Upstream) Reconnect(ctx context.Context) State {
+	if u.opts.Disabled {
+		return u.State()
+	}
 	u.reconnectMu.Lock()
 	defer u.reconnectMu.Unlock()
 

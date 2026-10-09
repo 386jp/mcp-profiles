@@ -37,6 +37,8 @@ type Proxy struct {
 	opts      Options
 	logger    *slog.Logger
 	names     []string // sorted profile names
+	visible   []string // names of the profiles that are not hidden
+	callable  []string // names of the profiles that are neither hidden nor disabled
 	upstreams map[string]*upstream.Upstream
 	progress  progressRelay
 
@@ -77,9 +79,19 @@ func New(cfg *config.Config, opts Options) *Proxy {
 			IdleTimeout:      cfg.Lazy.IdleTimeout,
 			TolerateMismatch: cfg.ToleratesMismatch(),
 			ReportMismatch:   cfg.SchemaMismatch == config.SchemaMismatchWarn,
+			Disabled:         profile.Disabled,
 		})
 	}
 	slices.Sort(p.names)
+	for _, name := range p.names {
+		profile := cfg.Profiles[name]
+		if !profile.Hidden {
+			p.visible = append(p.visible, name)
+		}
+		if profile.Callable() {
+			p.callable = append(p.callable, name)
+		}
+	}
 	return p
 }
 
@@ -129,17 +141,20 @@ func (p *Proxy) Close() {
 }
 
 // baseProfile is the profile whose tool definitions are exposed and compared against.
-func (p *Proxy) baseProfile() string {
-	if p.cfg.BaseProfile != "" {
-		return p.cfg.BaseProfile
+func (p *Proxy) baseProfile() string { return p.cfg.Base() }
+
+// closeHiddenBase disconnects the base profile once its tools are read, if clients cannot call it.
+func (p *Proxy) closeHiddenBase() {
+	base := p.baseProfile()
+	if p.cfg.Profiles[base].Hidden {
+		if err := p.upstreams[base].Close(); err != nil {
+			p.logger.Warn("failed to close upstream", "profile", base, "error", err)
+		}
 	}
-	if p.cfg.DefaultProfile != "" {
-		return p.cfg.DefaultProfile
-	}
-	return p.names[0]
 }
 
 // connectAll connects in parallel and returns the base profile's tools once all of them match.
+// Only the base profile and the callable profiles are connected.
 func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 	var (
 		wg    sync.WaitGroup
@@ -147,7 +162,12 @@ func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 		tools = map[string][]*mcp.Tool{}
 		errs  []error
 	)
-	for _, name := range p.names {
+	base := p.baseProfile()
+	connected := p.callable
+	if !slices.Contains(connected, base) {
+		connected = append(slices.Clone(connected), base)
+	}
+	for _, name := range connected {
 		wg.Go(func() {
 			t, err := p.upstreams[name].Connect(ctx)
 			mu.Lock()
@@ -164,9 +184,8 @@ func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 		return nil, errors.Join(errs...)
 	}
 
-	base := p.baseProfile()
 	if !p.cfg.ToleratesMismatch() {
-		for _, name := range p.names {
+		for _, name := range connected {
 			if name == base {
 				continue
 			}
@@ -182,13 +201,16 @@ func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 			return nil, errors.Join(errs...)
 		}
 	}
-	for name, u := range p.upstreams {
+	for _, u := range p.upstreams {
 		u.SetExpected(tools[base])
+	}
+	for _, name := range connected {
 		// With schemaMismatch "warn" or "silent", this records the tools that differ instead of failing.
-		if err := u.CheckTools(tools[name]); err != nil {
+		if err := p.upstreams[name].CheckTools(tools[name]); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", name, err)
 		}
 	}
+	p.closeHiddenBase()
 	return tools[base], nil
 }
 
@@ -203,7 +225,9 @@ func (p *Proxy) connectBase(ctx context.Context) ([]*mcp.Tool, error) {
 	for _, u := range p.upstreams {
 		u.SetExpected(tools)
 	}
-	if p.cfg.Lazy.KeepBase {
+	if p.cfg.Profiles[base].Hidden {
+		p.closeHiddenBase()
+	} else if p.cfg.Lazy.KeepBase {
 		p.markUsed(base)
 	} else {
 		p.upstreams[base].Release()
@@ -241,7 +265,7 @@ func (p *Proxy) markUsed(name string) {
 func (p *Proxy) buildServer(tools []*mcp.Tool) error {
 	exposed, err := toolset.WithProfileArg(tools, toolset.ProfileArg{
 		Name:         p.cfg.ProfileArg,
-		Profiles:     p.names,
+		Profiles:     p.callable,
 		Default:      p.cfg.DefaultProfile,
 		ListToolName: p.cfg.ListProfilesTool,
 	})
@@ -336,7 +360,7 @@ func (p *Proxy) takeProfile(args map[string]json.RawMessage) (string, error) {
 	delete(args, p.cfg.ProfileArg)
 	if !ok || string(raw) == "null" {
 		if p.cfg.DefaultProfile == "" {
-			return "", fmt.Errorf("argument %q is required; choose one of %s", p.cfg.ProfileArg, strings.Join(p.names, ", "))
+			return "", fmt.Errorf("argument %q is required; choose one of %s", p.cfg.ProfileArg, strings.Join(p.callable, ", "))
 		}
 		return p.cfg.DefaultProfile, nil
 	}
@@ -344,10 +368,17 @@ func (p *Proxy) takeProfile(args map[string]json.RawMessage) (string, error) {
 	if err := json.Unmarshal(raw, &profile); err != nil {
 		return "", fmt.Errorf("argument %q must be a string", p.cfg.ProfileArg)
 	}
-	if _, ok := p.upstreams[profile]; !ok {
-		return "", fmt.Errorf("unknown profile %q; choose one of %s", profile, strings.Join(p.names, ", "))
+	if !p.isVisible(profile) {
+		return "", fmt.Errorf("unknown profile %q; choose one of %s", profile, strings.Join(p.callable, ", "))
 	}
+	// A disabled profile is rejected by its upstream, with the reason.
 	return profile, nil
+}
+
+// isVisible reports whether name is a profile that clients can see: defined and not hidden.
+func (p *Proxy) isVisible(name string) bool {
+	profile, ok := p.cfg.Profiles[name]
+	return ok && !profile.Hidden
 }
 
 func parseArgs(raw json.RawMessage) (map[string]json.RawMessage, error) {

@@ -157,3 +157,37 @@ func TestParseSchemaOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestParseHiddenAndDisabled(t *testing.T) {
+	c, err := Parse([]byte(`{"profiles": {
+		"a": {"type": "http", "url": "u", "disabled": true},
+		"b": {"type": "http", "url": "u", "hidden": true},
+		"c": {"type": "http", "url": "u"}
+	}}`), env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The implicit base skips disabled profiles but may be hidden.
+	if got := c.Base(); got != "b" {
+		t.Errorf("Base() = %q, want b", got)
+	}
+
+	tests := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"hidden default", `{"defaultProfile": "a", "profiles": {"a": {"type": "http", "url": "u", "hidden": true}, "b": {"type": "http", "url": "u"}}}`, `defaultProfile "a" must be neither hidden nor disabled`},
+		{"disabled default", `{"defaultProfile": "a", "profiles": {"a": {"type": "http", "url": "u", "disabled": true}, "b": {"type": "http", "url": "u"}}}`, `defaultProfile "a" must be neither hidden nor disabled`},
+		{"disabled base", `{"baseProfile": "a", "profiles": {"a": {"type": "http", "url": "u", "disabled": true}, "b": {"type": "http", "url": "u"}}}`, `baseProfile "a" must not be disabled`},
+		{"nothing callable", `{"profiles": {"a": {"type": "http", "url": "u", "hidden": true}, "b": {"type": "http", "url": "u", "disabled": true}}}`, "at least one profile must be neither hidden nor disabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.json), env(nil))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("err = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}

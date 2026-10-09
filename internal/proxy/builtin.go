@@ -26,7 +26,7 @@ func (p *Proxy) listProfilesTool() *mcp.Tool {
 
 func (p *Proxy) handleListProfiles(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	res := listProfilesResult{DefaultProfile: p.cfg.DefaultProfile}
-	for _, name := range p.names {
+	for _, name := range p.visible {
 		res.Profiles = append(res.Profiles, p.upstreams[name].State())
 	}
 	return structuredResult(res)
@@ -42,7 +42,7 @@ func (p *Proxy) reconnectTool() *mcp.Tool {
 			"properties": map[string]any{
 				p.cfg.ProfileArg: map[string]any{
 					"type":        "string",
-					"enum":        p.names,
+					"enum":        p.callable,
 					"description": "Profile to reconnect.",
 				},
 			},
@@ -61,11 +61,13 @@ func (p *Proxy) handleReconnect(ctx context.Context, req *mcp.CallToolRequest) (
 	if err := json.Unmarshal(args[p.cfg.ProfileArg], &profile); err != nil {
 		return errorResult(fmt.Sprintf("argument %q is required and must be a string", p.cfg.ProfileArg)), nil
 	}
-	u, ok := p.upstreams[profile]
-	if !ok {
+	if !p.isVisible(profile) {
 		return errorResult(fmt.Sprintf("unknown profile %q", profile)), nil
 	}
-	state := u.Reconnect(ctx)
+	if p.cfg.Profiles[profile].Disabled {
+		return errorResult(fmt.Sprintf("profile %q is disabled in config and cannot be reconnected", profile)), nil
+	}
+	state := p.upstreams[profile].Reconnect(ctx)
 	if state.Status == upstream.StatusActive {
 		p.markUsed(profile)
 	}

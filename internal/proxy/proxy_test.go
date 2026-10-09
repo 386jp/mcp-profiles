@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -602,5 +603,109 @@ func TestSchemaMismatchSilent(t *testing.T) {
 	}
 	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})); got != "stg:hi" {
 		t.Errorf("echo on stg = %q", got)
+	}
+}
+
+func profileEnum(t *testing.T, d *downstream, tool string) []any {
+	t.Helper()
+	res, err := d.session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range res.Tools {
+		if tl.Name == tool {
+			props := tl.InputSchema.(map[string]any)["properties"].(map[string]any)
+			return props["profile"].(map[string]any)["enum"].([]any)
+		}
+	}
+	t.Fatalf("tool %q not found", tool)
+	return nil
+}
+
+func TestHiddenBaseProfile(t *testing.T) {
+	for _, lazy := range []config.Lazy{{}, {Enabled: true, MaxConnected: 1, KeepBase: true}} {
+		t.Run(fmt.Sprintf("lazy=%v", lazy.Enabled), func(t *testing.T) {
+			ref := startUpstream(t, newUpstreamServer("reference", false), nil)
+			dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+			cfg := &config.Config{
+				ProfileArg:       "profile",
+				BaseProfile:      "reference",
+				DefaultProfile:   "dev",
+				ListProfilesTool: "list_profiles",
+				ReconnectTool:    "reconnect_profile",
+				Lazy:             lazy,
+				Profiles: map[string]config.Profile{
+					"reference": {Type: config.TypeHTTP, URL: ref.url, Hidden: true},
+					"dev":       httpProfile(dev, nil),
+				},
+			}
+			_, d := startProxy(t, cfg)
+
+			res, err := d.session.ListTools(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := res.Tools[0].Description; got != "echo on reference" {
+				t.Errorf("description should come from the hidden base profile: %q", got)
+			}
+			if got := profileEnum(t, d, "echo"); !reflect.DeepEqual(got, []any{"dev"}) {
+				t.Errorf("enum = %v", got)
+			}
+			if got := profileEnum(t, d, "reconnect_profile"); !reflect.DeepEqual(got, []any{"dev"}) {
+				t.Errorf("reconnect enum = %v", got)
+			}
+			if _, ok := listProfiles(t, d)["reference"]; ok {
+				t.Error("hidden profile is listed")
+			}
+
+			res2 := call(t, d, "echo", map[string]any{"text": "hi", "profile": "reference"})
+			if !res2.IsError || !strings.Contains(text(t, res2), `unknown profile "reference"`) {
+				t.Errorf("call to hidden profile = %v %q", res2.IsError, text(t, res2))
+			}
+			if got := text(t, call(t, d, "echo", map[string]any{"text": "hi"})); got != "dev:hi" {
+				t.Errorf("got %q", got)
+			}
+		})
+	}
+}
+
+func TestDisabledProfile(t *testing.T) {
+	dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+	cfg := &config.Config{
+		ProfileArg:       "profile",
+		DefaultProfile:   "dev",
+		ListProfilesTool: "list_profiles",
+		ReconnectTool:    "reconnect_profile",
+		Profiles: map[string]config.Profile{
+			"dev": httpProfile(dev, nil),
+			// Never connected, so an unreachable upstream does not fail the startup.
+			"prod": {Type: config.TypeHTTP, URL: "http://127.0.0.1:1/mcp", Disabled: true},
+			"old":  {Type: config.TypeHTTP, URL: "http://127.0.0.1:1/mcp", Disabled: true, Hidden: true},
+		},
+	}
+	_, d := startProxy(t, cfg)
+
+	states := listProfiles(t, d)
+	if s := states["prod"]; s.Status != "disabled" || s.Reason != "disabled in config" {
+		t.Errorf("prod = %+v", s)
+	}
+	if _, ok := states["old"]; ok {
+		t.Error("a disabled and hidden profile is listed")
+	}
+	if got := profileEnum(t, d, "echo"); !reflect.DeepEqual(got, []any{"dev"}) {
+		t.Errorf("enum = %v", got)
+	}
+
+	res := call(t, d, "echo", map[string]any{"text": "hi", "profile": "prod"})
+	if !res.IsError || !strings.Contains(text(t, res), "disabled in config") {
+		t.Errorf("call to disabled profile = %v %q", res.IsError, text(t, res))
+	}
+	res = call(t, d, "reconnect_profile", map[string]any{"profile": "prod"})
+	if !res.IsError || !strings.Contains(text(t, res), "cannot be reconnected") {
+		t.Errorf("reconnect of disabled profile = %v %q", res.IsError, text(t, res))
+	}
+	res = call(t, d, "echo", map[string]any{"text": "hi", "profile": "old"})
+	if !res.IsError || !strings.Contains(text(t, res), `unknown profile "old"`) {
+		t.Errorf("call to disabled and hidden profile = %v %q", res.IsError, text(t, res))
 	}
 }

@@ -110,8 +110,8 @@ mcp-profiles is configured entirely by a JSON file. Its path is read from the `M
 | `listen` | `{"type": "stdio"}` | How clients connect (see below) |
 | `profiles` | (required) | Map from profile name to upstream definition |
 | `profileArg` | `"profile"` | Name of the argument added to every tool. Startup fails if it collides with an upstream argument |
-| `defaultProfile` | none | Profile used when `profile` is omitted. Without it, `profile` is required |
-| `baseProfile` | `defaultProfile`, or the first profile name in sorted order | Profile whose tool definitions are exposed, and that the other profiles are compared against |
+| `defaultProfile` | none | Profile used when `profile` is omitted. Without it, `profile` is required. Must be neither hidden nor disabled |
+| `baseProfile` | `defaultProfile`, or the first profile name in sorted order that is not disabled | Profile whose tool definitions are exposed, and that the other profiles are compared against. May be hidden, but not disabled |
 | `schemaMismatch` | `"fail"` | `fail`, `warn` or `silent`: what to do when a profile's tools differ from the base profile's (see [Schema mismatches](#schema-mismatches)) |
 | `listProfilesTool` | none | Name of the profile listing tool. Not exposed if omitted |
 | `reconnectTool` | none | Name of the reconnect tool. Not exposed if omitted |
@@ -133,6 +133,8 @@ Each entry has the same shape as an `.mcp.json` server entry.
 |---|---|---|
 | `type` | all | `stdio` or `http` (streamable HTTP) |
 | `description` | all | Description returned by the profile listing tool. Setting it without `listProfilesTool` is an error |
+| `hidden` | all | Hide the profile from clients: it is left out of the `profile` argument and the profile listing, and calls to it fail as an unknown profile. Use it for a `baseProfile` that only provides the tool definitions; it is disconnected once they are read |
+| `disabled` | all | Never connect the profile. It stays in the profile listing as `disabled` with the reason `disabled in config`, but is left out of the `profile` argument, and calls and reconnects fail. With `hidden` too, clients do not see it at all |
 | `url` / `headers` | `http` | Endpoint, and headers added to every request |
 | `command` / `args` / `env` | `stdio` | Command to start. `env` is added to the proxy's environment |
 
