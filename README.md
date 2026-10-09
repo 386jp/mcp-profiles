@@ -111,6 +111,8 @@ mcp-profiles is configured entirely by a JSON file. Its path is read from the `M
 | `profiles` | (required) | Map from profile name to upstream definition |
 | `profileArg` | `"profile"` | Name of the argument added to every tool. Startup fails if it collides with an upstream argument |
 | `defaultProfile` | none | Profile used when `profile` is omitted. Without it, `profile` is required |
+| `baseProfile` | `defaultProfile`, or the first profile name in sorted order | Profile whose tool definitions are exposed, and that the other profiles are compared against |
+| `schemaMismatch` | `"fail"` | `fail`, `warn` or `silent`: what to do when a profile's tools differ from the base profile's (see [Schema mismatches](#schema-mismatches)) |
 | `listProfilesTool` | none | Name of the profile listing tool. Not exposed if omitted |
 | `reconnectTool` | none | Name of the reconnect tool. Not exposed if omitted |
 | `log` | `{"level": "info", "format": "text"}` | `level` is `debug` / `info` / `warn` / `error`; `format` is `text` / `json`. Logs always go to stderr |
@@ -156,31 +158,51 @@ By default, every upstream is connected at startup and stays connected. With man
 "lazy": { "maxConnected": 2, "keepBase": true, "idleTimeout": "10m" }
 ```
 
-- At startup, only the base profile (`defaultProfile`, or the first profile name in sorted order) is connected, to read the tools. It is disconnected right after, unless `keepBase` is `true`.
-- A profile is connected on its first call, and its tools are checked against the base profile's then. A mismatch disables the profile instead of failing the startup.
+- At startup, only the base profile (`baseProfile`) is connected, to read the tools. It is disconnected right after, unless `keepBase` is `true`.
+- A profile is connected on its first call, and its tools are checked against the base profile's then. With `schemaMismatch: "fail"`, a mismatch disables the profile instead of failing the startup.
 - Only the `maxConnected` most recently used profiles stay connected (default `1`). When another profile is called, the least recently used connected one is disconnected once its running calls finish.
 - With `idleTimeout`, the connected profile is also disconnected after that long without calls. Defaults to `0s` (never).
 - Disconnected profiles show up as `idle`. Profiles disabled by a failure still need the reconnect tool.
 
 `"lazy": true` is the same as `"lazy": {}`: `maxConnected` defaults to `1` and `keepBase` to `false`.
 
+### Schema mismatches
+
+The tools exposed to clients are the base profile's. `schemaMismatch` decides what happens when another profile lacks one of them, or defines it with a different `inputSchema`:
+
+- `"fail"` (default): the startup fails. A mismatch found later (in [lazy mode](#lazy-mode), on reconnect or after a tool list change) disables the profile.
+- `"warn"`: the profile stays available. Calls to the tools that differ are rejected with an error without reaching the upstream, while the other tools work as usual. The profile listing tool shows a warning for that profile, and lists those tools with the reason (missing, or a different `inputSchema`):
+
+```json
+{
+  "name": "stg",
+  "status": "active",
+  "warning": "some tools differ from the definitions in your tool list and cannot be called on this profile",
+  "mismatchedTools": [{ "tool": "greet", "reason": "inputSchema differs on this profile" }]
+}
+```
+
+- `"silent"`: the same as `"warn"`, without the warning in the profile listing tool. Use it when the differences are intended, for example a profile backed by a read-only server, so that the listing does not spend tokens on them. Calls to the tools that differ are still rejected with an error.
+
+Tools that only a non-base profile has are not exposed, so they never count as a mismatch with `"warn"` or `"silent"`.
+
 ## Builtin tools
 
 | Tool | Description |
 |---|---|
-| Profile listing (`listProfilesTool`) | Returns each profile's name, `description`, status (`active` / `idle` / `reconnecting` / `disabled`) and the reason it was disabled |
-| Reconnect (`reconnectTool`) | Reconnects a profile, and makes it `active` again if its tools still match the ones seen at startup |
+| Profile listing (`listProfilesTool`) | Returns each profile's name, `description`, status (`active` / `idle` / `reconnecting` / `disabled`), the reason it was disabled, and with `schemaMismatch: "warn"`, a warning and the tools that differ |
+| Reconnect (`reconnectTool`) | Reconnects a profile, and makes it `active` again if its tools still match the ones seen at startup (or, with `schemaMismatch` `"warn"` or `"silent"`, regardless) |
 
 ## Upstream failures and changes
 
 - When the process of a stdio upstream exits, its profile becomes `disabled`.
-- When an upstream notifies that its tool list changed and the tool names or an `inputSchema` differ from startup, its profile becomes `disabled` too.
+- When an upstream notifies that its tool list changed and the tool names or an `inputSchema` differ from startup, its profile becomes `disabled` too, unless `schemaMismatch` is `"warn"` or `"silent"`.
 - Calls to a `disabled` profile return an error. Profiles never recover on their own; use the reconnect tool or restart the proxy.
 - A failed request to a streamable HTTP upstream does not disable its profile.
 
 ## How it works
 
-- At startup, mcp-profiles connects to the upstream of every profile and checks that they expose the same tool names and the same `inputSchema` for each tool. Any mismatch fails the startup. In [lazy mode](#lazy-mode), this check happens when each profile is first used.
+- At startup, mcp-profiles connects to the upstream of every profile and checks that they expose the same tool names and the same `inputSchema` for each tool. Any mismatch fails the startup, unless [`schemaMismatch`](#schema-mismatches) is `"warn"` or `"silent"`. In [lazy mode](#lazy-mode), this check happens when each profile is first used.
 - Every tool is exposed with an extra `profile` argument whose `enum` lists the profile names.
 - On `tools/call`, the `profile` argument is removed and the call is forwarded as is to the selected upstream.
 - Each upstream can use its own transport. stdio and streamable HTTP can be mixed.

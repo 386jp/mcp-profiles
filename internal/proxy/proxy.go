@@ -42,7 +42,7 @@ type Proxy struct {
 
 	recentMu sync.Mutex
 	recent   []string // profile names, most recently used first (lazy mode)
-	server    *mcp.Server
+	server   *mcp.Server
 
 	inflight inflight
 }
@@ -66,15 +66,17 @@ func New(cfg *config.Config, opts Options) *Proxy {
 	for name, profile := range cfg.Profiles {
 		p.names = append(p.names, name)
 		p.upstreams[name] = upstream.New(name, profile, upstream.Options{
-			Logger:         logger,
-			SDKLogger:      opts.SDKLogger,
-			Version:        opts.Version,
-			ConnectTimeout: cfg.StartupTimeout(),
-			CallTimeout:    cfg.CallTimeout(),
-			OnProgress:     p.progress.forward,
-			Transport:      opts.Transports[name],
-			Lazy:           cfg.Lazy.Enabled,
-			IdleTimeout:    cfg.Lazy.IdleTimeout,
+			Logger:           logger,
+			SDKLogger:        opts.SDKLogger,
+			Version:          opts.Version,
+			ConnectTimeout:   cfg.StartupTimeout(),
+			CallTimeout:      cfg.CallTimeout(),
+			OnProgress:       p.progress.forward,
+			Transport:        opts.Transports[name],
+			Lazy:             cfg.Lazy.Enabled,
+			IdleTimeout:      cfg.Lazy.IdleTimeout,
+			TolerateMismatch: cfg.ToleratesMismatch(),
+			ReportMismatch:   cfg.SchemaMismatch == config.SchemaMismatchWarn,
 		})
 	}
 	slices.Sort(p.names)
@@ -126,8 +128,11 @@ func (p *Proxy) Close() {
 	wg.Wait()
 }
 
-// baseProfile is the profile whose tool definitions are exposed.
+// baseProfile is the profile whose tool definitions are exposed and compared against.
 func (p *Proxy) baseProfile() string {
+	if p.cfg.BaseProfile != "" {
+		return p.cfg.BaseProfile
+	}
 	if p.cfg.DefaultProfile != "" {
 		return p.cfg.DefaultProfile
 	}
@@ -160,23 +165,29 @@ func (p *Proxy) connectAll(ctx context.Context) ([]*mcp.Tool, error) {
 	}
 
 	base := p.baseProfile()
-	for _, name := range p.names {
-		if name == base {
-			continue
+	if !p.cfg.ToleratesMismatch() {
+		for _, name := range p.names {
+			if name == base {
+				continue
+			}
+			diffs, err := toolset.Diff(tools[base], tools[name])
+			if err != nil {
+				return nil, fmt.Errorf("profile %q: %w", name, err)
+			}
+			if diffs != nil {
+				errs = append(errs, fmt.Errorf("profile %q: tools differ from base profile %q: %s", name, base, toolset.FormatDiff(diffs)))
+			}
 		}
-		diffs, err := toolset.Diff(tools[base], tools[name])
-		if err != nil {
+		if len(errs) > 0 {
+			return nil, errors.Join(errs...)
+		}
+	}
+	for name, u := range p.upstreams {
+		u.SetExpected(tools[base])
+		// With schemaMismatch "warn" or "silent", this records the tools that differ instead of failing.
+		if err := u.CheckTools(tools[name]); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", name, err)
 		}
-		if diffs != nil {
-			errs = append(errs, fmt.Errorf("profile %q: tools differ from base profile %q: %s", name, base, toolset.FormatDiff(diffs)))
-		}
-	}
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
-	}
-	for _, u := range p.upstreams {
-		u.SetExpected(tools[base])
 	}
 	return tools[base], nil
 }

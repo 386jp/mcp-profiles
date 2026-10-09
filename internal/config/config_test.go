@@ -128,3 +128,32 @@ func TestParseLazy(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSchemaOptions(t *testing.T) {
+	const profiles = `"profiles": {"dev": {"type": "http", "url": "u"}, "prod": {"type": "http", "url": "u"}}`
+	c, err := Parse([]byte(`{`+profiles+`}`), env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SchemaMismatch != SchemaMismatchFail || c.BaseProfile != "" {
+		t.Errorf("defaults: schemaMismatch = %q, baseProfile = %q", c.SchemaMismatch, c.BaseProfile)
+	}
+
+	c, err = Parse([]byte(`{"baseProfile": "prod", "schemaMismatch": "warn", `+profiles+`}`), env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SchemaMismatch != SchemaMismatchWarn || c.BaseProfile != "prod" {
+		t.Errorf("schemaMismatch = %q, baseProfile = %q", c.SchemaMismatch, c.BaseProfile)
+	}
+
+	for bad, want := range map[string]string{
+		`"baseProfile": "stg",`:       `baseProfile "stg"`,
+		`"schemaMismatch": "ignore",`: "schemaMismatch must be",
+		`"schemaMismatch": "warn ",`:  "schemaMismatch must be",
+	} {
+		if _, err := Parse([]byte(`{`+bad+profiles+`}`), env(nil)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Parse(%s) err = %v, want containing %q", bad, err, want)
+		}
+	}
+}

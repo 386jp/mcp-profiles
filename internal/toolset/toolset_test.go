@@ -107,3 +107,24 @@ func TestWithProfileArg(t *testing.T) {
 		}
 	})
 }
+
+func TestMismatched(t *testing.T) {
+	base := []*mcp.Tool{
+		tool(t, "same", `{"type": "object"}`),
+		tool(t, "changed", `{"type": "object", "properties": {"x": {"type": "string"}}}`),
+		tool(t, "missing", `{"type": "object"}`),
+	}
+	other := []*mcp.Tool{
+		tool(t, "same", `{"type": "object"}`),
+		tool(t, "changed", `{"type": "object", "properties": {"x": {"type": "number"}}}`),
+		tool(t, "extra", `{"type": "object"}`),
+	}
+	got, err := Mismatched(base, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Mismatch{{Tool: "changed", Reason: ReasonInputSchema}, {Tool: "missing", Reason: ReasonMissing}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Mismatched = %v, want %v", got, want)
+	}
+}

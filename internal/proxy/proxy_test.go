@@ -16,6 +16,8 @@ import (
 
 	"github.com/386jp/mcp-profiles/internal/config"
 	"github.com/386jp/mcp-profiles/internal/listen"
+	"github.com/386jp/mcp-profiles/internal/toolset"
+	"github.com/386jp/mcp-profiles/internal/upstream"
 )
 
 // progressDelivered is signaled when the downstream client receives a progress notification.
@@ -414,4 +416,191 @@ func TestLazyMaxConnected(t *testing.T) {
 	// Using stg again keeps it, and dev stays as the second most recent.
 	call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})
 	waitStatuses(t, d, map[string]string{"dev": "active", "stg": "active", "prod": "idle"})
+}
+
+type greetArgs struct {
+	Name string `json:"name"`
+}
+
+type greetArgsV2 struct {
+	Name   string `json:"name"`
+	Formal bool   `json:"formal"`
+}
+
+// newGreetServer returns an echo server with a greet tool whose definition depends on variant:
+// "same", "changed" (different inputSchema) or "missing".
+func newGreetServer(label, variant string) *mcp.Server {
+	s := newUpstreamServer(label, false)
+	switch variant {
+	case "same":
+		mcp.AddTool(s, &mcp.Tool{Name: "greet"}, func(_ context.Context, _ *mcp.CallToolRequest, args greetArgs) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: label + ":hello " + args.Name}}}, nil, nil
+		})
+	case "changed":
+		mcp.AddTool(s, &mcp.Tool{Name: "greet"}, func(_ context.Context, _ *mcp.CallToolRequest, args greetArgsV2) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: label + ":hello " + args.Name}}}, nil, nil
+		})
+	}
+	return s
+}
+
+func listProfiles(t *testing.T, d *downstream) map[string]upstream.State {
+	t.Helper()
+	var got listProfilesResult
+	if err := json.Unmarshal([]byte(text(t, call(t, d, "list_profiles", nil))), &got); err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]upstream.State{}
+	for _, s := range got.Profiles {
+		m[s.Name] = s
+	}
+	return m
+}
+
+func warnings(t *testing.T, d *downstream) map[string]string {
+	t.Helper()
+	var got listProfilesResult
+	if err := json.Unmarshal([]byte(text(t, call(t, d, "list_profiles", nil))), &got); err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]string{}
+	for _, s := range got.Profiles {
+		m[s.Name] = s.Warning
+	}
+	return m
+}
+
+func TestBaseProfile(t *testing.T) {
+	dev := startUpstream(t, newUpstreamServer("dev", false), nil)
+	prod := startUpstream(t, newUpstreamServer("prod", false), nil)
+	cfg := &config.Config{
+		ProfileArg:     "profile",
+		BaseProfile:    "prod",
+		DefaultProfile: "dev",
+		Profiles:       map[string]config.Profile{"dev": httpProfile(dev, nil), "prod": httpProfile(prod, nil)},
+	}
+	_, d := startProxy(t, cfg)
+
+	res, err := d.session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Tools[0].Description; got != "echo on prod" {
+		t.Errorf("description should come from the base profile: %q", got)
+	}
+	// Routing still defaults to defaultProfile.
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi"})); got != "dev:hi" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func warnConfig(lazy config.Lazy, servers map[string]*mcp.Server, t *testing.T) *config.Config {
+	return mismatchConfig(config.SchemaMismatchWarn, lazy, servers, t)
+}
+
+func mismatchConfig(mode string, lazy config.Lazy, servers map[string]*mcp.Server, t *testing.T) *config.Config {
+	cfg := &config.Config{
+		ProfileArg:       "profile",
+		BaseProfile:      "dev",
+		DefaultProfile:   "dev",
+		ListProfilesTool: "list_profiles",
+		SchemaMismatch:   mode,
+		Lazy:             lazy,
+		Profiles:         map[string]config.Profile{},
+	}
+	for name, s := range servers {
+		cfg.Profiles[name] = httpProfile(startUpstream(t, s, nil), nil)
+	}
+	return cfg
+}
+
+func TestSchemaMismatchWarn(t *testing.T) {
+	_, d := startProxy(t, warnConfig(config.Lazy{}, map[string]*mcp.Server{
+		"dev":  newGreetServer("dev", "same"),
+		"stg":  newGreetServer("stg", "changed"),
+		"prod": newGreetServer("prod", "missing"),
+	}, t))
+
+	// Startup succeeds and the differing profiles stay active with a warning.
+	waitStatuses(t, d, map[string]string{"dev": "active", "stg": "active", "prod": "active"})
+	w := warnings(t, d)
+	if w["dev"] != "" || !strings.Contains(w["stg"], "differ from the definitions in your tool list") || w["prod"] == "" {
+		t.Errorf("warnings = %v", w)
+	}
+	states := listProfiles(t, d)
+	for profile, want := range map[string][]toolset.Mismatch{
+		"dev":  nil,
+		"stg":  {{Tool: "greet", Reason: toolset.ReasonInputSchema}},
+		"prod": {{Tool: "greet", Reason: toolset.ReasonMissing}},
+	} {
+		if got := states[profile].MismatchedTools; !reflect.DeepEqual(got, want) {
+			t.Errorf("mismatchedTools of %s = %v, want %v", profile, got, want)
+		}
+	}
+
+	// Tools that match still work on every profile.
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})); got != "stg:hi" {
+		t.Errorf("echo on stg = %q", got)
+	}
+	if got := text(t, call(t, d, "greet", map[string]any{"name": "a", "profile": "dev"})); got != "dev:hello a" {
+		t.Errorf("greet on dev = %q", got)
+	}
+
+	// Tools that differ or are missing are rejected without calling the upstream.
+	for _, profile := range []string{"stg", "prod"} {
+		res := call(t, d, "greet", map[string]any{"name": "a", "profile": profile})
+		want := `tool "greet" on profile "` + profile + `" differs from its definition in your tool list, so it was not called`
+		if !res.IsError || !strings.Contains(text(t, res), want) {
+			t.Errorf("greet on %s = %v %q", profile, res.IsError, text(t, res))
+		}
+	}
+}
+
+func TestSchemaMismatchWarnLazy(t *testing.T) {
+	_, d := startProxy(t, warnConfig(config.Lazy{Enabled: true, MaxConnected: 1}, map[string]*mcp.Server{
+		"dev": newGreetServer("dev", "same"),
+		"stg": newGreetServer("stg", "changed"),
+	}, t))
+
+	res := call(t, d, "greet", map[string]any{"name": "a", "profile": "stg"})
+	if !res.IsError || !strings.Contains(text(t, res), "differs from its definition in your tool list") {
+		t.Errorf("greet on stg = %v %q", res.IsError, text(t, res))
+	}
+	waitStatuses(t, d, map[string]string{"dev": "idle", "stg": "active"})
+	if w := warnings(t, d); w["stg"] == "" {
+		t.Errorf("warnings = %v", w)
+	}
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})); got != "stg:hi" {
+		t.Errorf("echo on stg = %q", got)
+	}
+}
+
+func TestSchemaMismatchWarnIgnoresExtraTools(t *testing.T) {
+	_, d := startProxy(t, warnConfig(config.Lazy{}, map[string]*mcp.Server{
+		"dev":  newUpstreamServer("dev", false),
+		"prod": newUpstreamServer("prod", true),
+	}, t))
+	if w := warnings(t, d); w["prod"] != "" {
+		t.Errorf("a profile with only extra tools should not warn: %v", w)
+	}
+}
+
+func TestSchemaMismatchSilent(t *testing.T) {
+	_, d := startProxy(t, mismatchConfig(config.SchemaMismatchSilent, config.Lazy{}, map[string]*mcp.Server{
+		"dev": newGreetServer("dev", "same"),
+		"stg": newGreetServer("stg", "missing"),
+	}, t))
+
+	// Nothing is reported in the listing.
+	if s := listProfiles(t, d)["stg"]; s.Status != "active" || s.Warning != "" || s.MismatchedTools != nil {
+		t.Errorf("stg = %+v", s)
+	}
+	// Calls to the missing tool are still rejected; the others work.
+	res := call(t, d, "greet", map[string]any{"name": "a", "profile": "stg"})
+	if !res.IsError || !strings.Contains(text(t, res), "differs from its definition in your tool list") {
+		t.Errorf("greet on stg = %v %q", res.IsError, text(t, res))
+	}
+	if got := text(t, call(t, d, "echo", map[string]any{"text": "hi", "profile": "stg"})); got != "stg:hi" {
+		t.Errorf("echo on stg = %q", got)
+	}
 }

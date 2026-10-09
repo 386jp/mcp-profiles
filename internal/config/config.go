@@ -17,6 +17,18 @@ const EnvConfigPath = "MCP_PROFILES_CONFIG"
 // DefaultConfigPath is used when EnvConfigPath is not set.
 const DefaultConfigPath = "mcp-profiles.json"
 
+// Values of schemaMismatch.
+const (
+	// SchemaMismatchFail fails the startup, or disables the profile once running.
+	SchemaMismatchFail = "fail"
+	// SchemaMismatchWarn keeps the profile, rejects calls to the tools that differ and
+	// reports them in the profile listing tool.
+	SchemaMismatchWarn = "warn"
+	// SchemaMismatchSilent is SchemaMismatchWarn without the report, for intended differences
+	// such as a read-only profile.
+	SchemaMismatchSilent = "silent"
+)
+
 // Transport types shared by listen and profile entries.
 const (
 	TypeStdio = "stdio"
@@ -42,7 +54,9 @@ type Config struct {
 	Timeouts         Timeouts           `json:"timeouts"`
 	Lazy             Lazy               `json:"lazy"`
 	ProfileArg       string             `json:"profileArg"`
+	BaseProfile      string             `json:"baseProfile"`
 	DefaultProfile   string             `json:"defaultProfile"`
+	SchemaMismatch   string             `json:"schemaMismatch"`
 	ListProfilesTool string             `json:"listProfilesTool"`
 	ReconnectTool    string             `json:"reconnectTool"`
 	Profiles         map[string]Profile `json:"profiles"`
@@ -67,6 +81,11 @@ type Timeouts struct {
 	Startup  *Duration `json:"startup"`
 	Call     *Duration `json:"call"`
 	Shutdown *Duration `json:"shutdown"`
+}
+
+// ToleratesMismatch reports whether profiles whose tools differ stay available.
+func (c *Config) ToleratesMismatch() bool {
+	return c.SchemaMismatch == SchemaMismatchWarn || c.SchemaMismatch == SchemaMismatchSilent
 }
 
 // Lazy enables lazy mode, where upstreams are connected on first use and only the
@@ -217,6 +236,9 @@ func (c *Config) applyDefaults() {
 	if c.ProfileArg == "" {
 		c.ProfileArg = defaultProfileArg
 	}
+	if c.SchemaMismatch == "" {
+		c.SchemaMismatch = SchemaMismatchFail
+	}
 }
 
 func (c *Config) validate() error {
@@ -254,6 +276,16 @@ func (c *Config) validate() error {
 		if _, ok := c.Profiles[c.DefaultProfile]; !ok {
 			add("defaultProfile %q is not defined in profiles", c.DefaultProfile)
 		}
+	}
+	if c.BaseProfile != "" {
+		if _, ok := c.Profiles[c.BaseProfile]; !ok {
+			add("baseProfile %q is not defined in profiles", c.BaseProfile)
+		}
+	}
+	switch c.SchemaMismatch {
+	case SchemaMismatchFail, SchemaMismatchWarn, SchemaMismatchSilent:
+	default:
+		add("schemaMismatch must be %q, %q or %q: %q", SchemaMismatchFail, SchemaMismatchWarn, SchemaMismatchSilent, c.SchemaMismatch)
 	}
 	if c.ListProfilesTool != "" && c.ListProfilesTool == c.ReconnectTool {
 		add("listProfilesTool and reconnectTool must differ: %q", c.ListProfilesTool)
